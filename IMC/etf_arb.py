@@ -34,10 +34,10 @@ COMPONENTS = ["TIDE_SPOT", "WX_SPOT", "LHR_COUNT"]
 ALL_PRODUCTS = [ETF] + COMPONENTS
 
 POS_LIMIT = 100
-MIN_EDGE = 20.0
+MIN_EDGE = 5.0
 MIN_COOLDOWN = 0.5
 MAX_TRADE_VOL = 5
-MAX_SKEW = 2.5  # Max edge reduction when position is at POS_LIMIT
+MAX_SKEW = 4.5  # Max edge reduction when position is at POS_LIMIT
 
 
 def ts() -> str:
