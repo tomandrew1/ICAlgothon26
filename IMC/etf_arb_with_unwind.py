@@ -39,14 +39,14 @@ ALL_PRODUCTS = [ETF] + COMPONENTS
 
 POS_LIMIT = 100
 MIN_EDGE = 2.0
-MIN_COOLDOWN = 0.5
+MIN_COOLDOWN = 0.01
 MAX_TRADE_VOL = 7
 MAX_SKEW = 3.5  # Max edge reduction when ETF position is at POS_LIMIT
 
 # ── unwind behavior ─────────────────────────────────────────────────────
 UNWIND_EDGE = 2.0         # accept low edge when trade reduces inventory risk
 LIMIT_UNWIND_EDGE = 0.0   # accept almost no edge when near limits
-LIMIT_NEAR = 90           # treat |pos| >= 90 as "near limit"
+LIMIT_NEAR = 50           # treat |pos| >= 90 as "near limit"
 # ───────────────────────────────────────────────────────────────────────
 
 
