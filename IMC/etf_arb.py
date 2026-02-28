@@ -34,9 +34,10 @@ COMPONENTS = ["TIDE_SPOT", "WX_SPOT", "LHR_COUNT"]
 ALL_PRODUCTS = [ETF] + COMPONENTS
 
 POS_LIMIT = 100
-MIN_EDGE = 2.0
+MIN_EDGE = 20.0
 MIN_COOLDOWN = 0.5
 MAX_TRADE_VOL = 5
+MAX_SKEW = 2.5  # Max edge reduction when position is at POS_LIMIT
 
 
 def ts() -> str:
@@ -124,9 +125,20 @@ class EtfArbBot(BaseBot):
         pb = pos.get(COMPONENTS[1], 0)
         pc = pos.get(COMPONENTS[2], 0)
 
+        # ─── DYNAMIC INVENTORY SKEW ──────────────────────────────────────
+        # Use ETF position (pe) as a proxy for the overall basket tilt.
+        # If pe > 0 (Long ETF, Short Basket), inventory_skew is positive.
+        inventory_skew = (pe / POS_LIMIT) * MAX_SKEW
+        
+        # Adjust required edges:
+        # If long ETF, required_edge1 drops (easier to sell), required_edge2 rises (harder to buy)
+        required_edge1 = MIN_EDGE - inventory_skew  
+        required_edge2 = MIN_EDGE + inventory_skew  
+        # ─────────────────────────────────────────────────────────────────
+
         # Case 1: ETF rich → sell ETF, buy components
         edge1 = E.bid_px - basket_ask
-        if edge1 > MIN_EDGE:
+        if edge1 > required_edge1:
             vol = min(
                 min(E.bid_sz, MAX_TRADE_VOL),
                 min(A.ask_sz, B.ask_sz, C.ask_sz, MAX_TRADE_VOL),
@@ -137,8 +149,9 @@ class EtfArbBot(BaseBot):
             )
             if vol >= 1:
                 self._fire_arb(
-                    label="ETF RICH  → sell ETF, buy basket",
+                    label=f"ETF RICH  → sell ETF, buy basket (Req Edge: {required_edge1:.1f})",
                     edge_per_lot=edge1,
+                    # ... rest of your _fire_arb arguments stay the same ...
                     vol=vol,
                     orders=[
                         OrderRequest(ETF, E.bid_px, Side.SELL, vol),
@@ -154,7 +167,7 @@ class EtfArbBot(BaseBot):
 
         # Case 2: ETF cheap → buy ETF, sell components
         edge2 = basket_bid - E.ask_px
-        if edge2 > MIN_EDGE:
+        if edge2 > required_edge2:
             vol = min(
                 min(E.ask_sz, MAX_TRADE_VOL),
                 min(A.bid_sz, B.bid_sz, C.bid_sz, MAX_TRADE_VOL),
@@ -165,8 +178,9 @@ class EtfArbBot(BaseBot):
             )
             if vol >= 1:
                 self._fire_arb(
-                    label="ETF CHEAP → buy ETF, sell basket",
+                    label=f"ETF CHEAP → buy ETF, sell basket (Req Edge: {required_edge2:.1f})",
                     edge_per_lot=edge2,
+                    # ... rest of your _fire_arb arguments stay the same ...
                     vol=vol,
                     orders=[
                         OrderRequest(ETF, E.ask_px, Side.BUY, vol),
