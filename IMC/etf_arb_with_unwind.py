@@ -246,9 +246,9 @@ class EtfArbBot(BaseBot):
         required_edge1 = unwind_thresh if case1_is_unwind else required_edge1_normal
         required_edge2 = unwind_thresh if case2_is_unwind else required_edge2_normal
 
-        # Case 1: ETF rich → sell ETF, buy components
+        # Case 1: ETF rich -> sell ETF, buy components (edge = E.bid - basket_ask)
         edge1 = E.bid_px - basket_ask
-        if edge1 > required_edge1:
+        if edge1 >= required_edge1:
             vol = min(
                 min(E.bid_sz, MAX_TRADE_VOL),
                 min(A.ask_sz, B.ask_sz, C.ask_sz, MAX_TRADE_VOL),
@@ -261,7 +261,7 @@ class EtfArbBot(BaseBot):
                 why = "UNWIND" if case1_is_unwind else "NORMAL"
                 self._fire_arb(
                     label=(
-                        f"ETF RICH  → sell ETF, buy basket [{why}] "
+                        f"ETF RICH  -> sell ETF, buy basket [{why}] "
                         f"(Req Edge: {required_edge1:.1f})"
                     ),
                     edge_per_lot=edge1,
@@ -280,13 +280,13 @@ class EtfArbBot(BaseBot):
             self._log_skip(f"case1 vol=0 (bid_sz={E.bid_sz} ask_sz={A.ask_sz},{B.ask_sz},{C.ask_sz} limits)")
         else:
             self._log_skip(
-                f"case1 edge {edge1:.1f} <= req {required_edge1:.1f} "
+                f"case1 edge {edge1:.1f} < req {required_edge1:.1f} "
                 f"(E.bid={E.bid_px} basket_ask={basket_ask:.0f})"
             )
 
-        # Case 2: ETF cheap → buy ETF, sell components
+        # Case 2: ETF cheap -> buy ETF, sell components (edge = basket_bid - E.ask)
         edge2 = basket_bid - E.ask_px
-        if edge2 > required_edge2:
+        if edge2 >= required_edge2:
             vol = min(
                 min(E.ask_sz, MAX_TRADE_VOL),
                 min(A.bid_sz, B.bid_sz, C.bid_sz, MAX_TRADE_VOL),
@@ -299,7 +299,7 @@ class EtfArbBot(BaseBot):
                 why = "UNWIND" if case2_is_unwind else "NORMAL"
                 self._fire_arb(
                     label=(
-                        f"ETF CHEAP → buy ETF, sell basket [{why}] "
+                        f"ETF CHEAP -> buy ETF, sell basket [{why}] "
                         f"(Req Edge: {required_edge2:.1f})"
                     ),
                     edge_per_lot=edge2,
@@ -318,7 +318,7 @@ class EtfArbBot(BaseBot):
             self._log_skip(f"case2 vol=0 (ask_sz={E.ask_sz} bid_sz={A.bid_sz},{B.bid_sz},{C.bid_sz} limits)")
         else:
             self._log_skip(
-                f"case2 edge {edge2:.1f} <= req {required_edge2:.1f} "
+                f"case2 edge {edge2:.1f} < req {required_edge2:.1f} "
                 f"(basket_bid={basket_bid:.0f} E.ask={E.ask_px})"
             )
 
@@ -357,7 +357,7 @@ class EtfArbBot(BaseBot):
         self._theoretical_pnl += trade_theo_pnl
 
         pe, pa, pb, pc = positions
-        print(f"\n{'─'*72}")
+        print(f"\n{'-'*72}")
         print(f"[{ts()}] ARB #{self._arb_count}  {label}")
         print(
             f"  edge/lot = {edge_per_lot:.1f}  |  vol = {vol}  |  "
@@ -403,7 +403,7 @@ class EtfArbBot(BaseBot):
                         f"status={status}  id={oid}"
                     )
 
-        print(f"{'─'*72}")
+        print(f"{'-'*72}")
 
     # ── run forever ──────────────────────────────────────────────────────
 
@@ -412,7 +412,7 @@ class EtfArbBot(BaseBot):
         pnl_data = self.get_pnl()
         self._start_pnl = pnl_data.get("totalProfit", 0.0)
 
-        print(f"[{ts()}] ═══ ETF Arbitrage Bot Started ═══")
+        print(f"[{ts()}] === ETF Arbitrage Bot Started ===")
         print(f"  user:       {self.username}")
         print(f"  ETF:        {ETF}  =  {' + '.join(COMPONENTS)}")
         print(
@@ -431,7 +431,7 @@ class EtfArbBot(BaseBot):
         self.start()
 
         def _shutdown(sig, frame):
-            print(f"\n[{ts()}] ═══ Shutting down ═══")
+            print(f"\n[{ts()}] === Shutting down ===")
             self.cancel_all_orders()
             self.stop()
             final = self.get_pnl()
