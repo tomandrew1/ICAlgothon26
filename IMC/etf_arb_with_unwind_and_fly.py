@@ -1,17 +1,19 @@
 #!/usr/bin/env python3 -u
-"""ETF cross-arbitrage bot with per-trade PnL tracking (with unwind).
+"""ETF cross-arbitrage bot with per-trade PnL tracking + LHR_FLY option structure.
 
 Trades LON_ETF against its components (TIDE_SPOT + WX_SPOT + LHR_COUNT).
-Runs indefinitely, prints every trade and theoretical PnL.
+Also trades LHR_FLY (option structure: +2P6200 +2C6200 -2C6600 +3C7000)
+using LHR_COUNT mid as fair value, subject to spread quality filter.
 
 Key behavior:
 - Normal arbs require MIN_EDGE (with mild ETF-position skew).
 - If an arb would REDUCE total inventory risk (sum of abs positions),
   we accept a MUCH smaller edge (UNWIND_EDGE), and even smaller when near limits.
+- LHR_FLY: compute payoff(LHR_mid), market-take if mispriced by FLY_MIN_EDGE,
+  provided LHR spread is <= FLY_MAX_SPREAD_PCT.
 
 Usage:
-    python -u etf_arb_with_unwind.py
-    DIAG=1 python -u etf_arb_with_unwind.py   # verbose diagnostics
+    python -u etf_arb.py
 """
 
 from __future__ import annotations
@@ -23,40 +25,50 @@ import time
 
 os.environ["PYTHONUNBUFFERED"] = "1"
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from threading import Thread
 from typing import Optional
 
-import requests
-
 from bot_template import BaseBot, OrderBook, OrderRequest, OrderResponse, Side, Trade
 
-EXCHANGE_URL = "http://ec2-52-19-74-159.eu-west-1.compute.amazonaws.com"
-USERNAME = "RATT"
-PASSWORD = "ratt67"
+EXCHANGE_URL = "http://ec2-52-49-69-152.eu-west-1.compute.amazonaws.com/"
+USERNAME = "Y"
+PASSWORD = "y"
 
 ETF = "LON_ETF"
 COMPONENTS = ["TIDE_SPOT", "WX_SPOT", "LHR_COUNT"]
-ALL_PRODUCTS = [ETF] + COMPONENTS
+LHR_INDEX = "LHR_COUNT"   # underlying for the fly
+LHR_FLY   = "LHR_FLY"
+ALL_PRODUCTS = [ETF] + COMPONENTS + [LHR_FLY]
 
-POS_LIMIT = 100
-MIN_EDGE = 2.0
-MIN_COOLDOWN = 0.2
+# ── ETF arb parameters ───────────────────────────────────────────────────
+POS_LIMIT     = 100
+MIN_EDGE      = 2.0
+MIN_COOLDOWN  = 0.2
 MAX_TRADE_VOL = 7
-MAX_SKEW = 3.5  # Max edge reduction when ETF position is at POS_LIMIT
+MAX_SKEW      = 1.5   # max edge reduction when ETF pos is at POS_LIMIT
 
-# ── unwind behavior ─────────────────────────────────────────────────────
-UNWIND_EDGE = 1.0         # accept low edge when trade reduces inventory risk
+# ── unwind behavior ──────────────────────────────────────────────────────
+UNWIND_EDGE       = 1.0   # accept low edge when trade reduces inventory risk
 LIMIT_UNWIND_EDGE = 0.0   # accept almost no edge when near limits
-LIMIT_NEAR = 60           # treat |pos| >= 90 as "near limit"
-# ───────────────────────────────────────────────────────────────────────
+LIMIT_NEAR        = 80    # treat |pos| >= LIMIT_NEAR as "near limit"
 
-# ── diagnostics ────────────────────────────────────────────────────────
-DIAG = os.environ.get("DIAG", "").strip() in ("1", "true", "yes")
-IOC_CANCEL_DELAY_S = 0.05  # small delay before cancel to allow exchange to match
-SKIP_LOG_INTERVAL_S = 2.0  # min interval between "why no trade" logs when DIAG
-# ───────────────────────────────────────────────────────────────────────
+# ── LHR_FLY parameters ──────────────────────────────────────────────────
+# Payoff: +2 P6200  +2 C6200  -2 C6600  +3 C7000
+# Strikes
+FLY_STRIKES = {
+    "P6200": (6200, "put",  +2),
+    "C6200": (6200, "call", +2),
+    "C6600": (6600, "call", -2),
+    "C7000": (7000, "call", +3),
+}
+FLY_MIN_EDGE        = 2.0   # min edge (fair - market) to trade
+FLY_MAX_VOL         = 3     # max lots per trade
+FLY_POS_LIMIT       = 30    # separate pos limit for LHR_FLY
+FLY_MAX_SPREAD_PCT  = 0.1  # reject LHR quote if spread > 5%
+FLY_COOLDOWN        = 0.3   # separate cooldown for fly trades (s)
+# ────────────────────────────────────────────────────────────────────────
 
 
 def ts() -> str:
@@ -81,69 +93,13 @@ class EtfArbBot(BaseBot):
     def __init__(self, cmi_url: str, username: str, password: str):
         super().__init__(cmi_url, username, password)
         self._top: dict[str, TopOfBook] = {p: TopOfBook() for p in ALL_PRODUCTS}
-        self._last_trade_time = 0.0
-        self._arb_count = 0
-        self._theoretical_pnl = 0.0
+        self._last_trade_time  = 0.0
+        self._last_fly_time    = 0.0
+        self._arb_count        = 0
+        self._fly_count        = 0
+        self._theoretical_pnl  = 0.0
+        self._fly_theo_pnl     = 0.0
         self._start_pnl: Optional[float] = None
-        self._last_skip_log_time = 0.0
-        self._skip_reason: Optional[str] = None
-
-    def _diag(self, msg: str) -> None:
-        if DIAG:
-            print(f"  [{ts()}] DIAG  {msg}")
-
-    def send_order(self, order: OrderRequest) -> OrderResponse | None:
-        """Override to add diagnostics and robust response parsing."""
-        payload = asdict(order)
-        url = f"{self._cmi_url}/api/order"
-        try:
-            response = requests.post(
-                url,
-                json=payload,
-                headers=self._auth_headers(),
-                timeout=10,
-            )
-        except Exception as e:
-            self._diag(f"send_order EXCEPTION {order.product} {order.side}: {e}")
-            return None
-
-        if DIAG:
-            print(f"  [{ts()}] DIAG  REQ  {order.product} {order.side} {order.volume} @ {order.price}  payload={payload}")
-
-        if not response.ok:
-            print(
-                f"  [{ts()}] ORDER FAIL  {order.product} {order.side} vol={order.volume}  "
-                f"status={response.status_code}  body={response.text[:500]}"
-            )
-            return None
-
-        try:
-            data = response.json()
-        except Exception as e:
-            print(f"  [{ts()}] ORDER BAD JSON  {order.product}  {e}  body={response.text[:300]}")
-            return None
-
-        # API may return camelCase; normalize to OrderResponse field names
-        key_map = {
-            "productSymbol": "product",
-            "filledVolume": "filled",
-            "orderVolume": "volume",
-        }
-        normalized = dict(data)
-        for api_key, our_key in key_map.items():
-            if api_key in normalized and our_key not in normalized:
-                normalized[our_key] = normalized[api_key]
-
-        fields = set(OrderResponse.__dataclass_fields__)
-        filtered = {k: v for k, v in normalized.items() if k in fields}
-        try:
-            return OrderResponse(**filtered)
-        except (TypeError, KeyError) as e:
-            print(
-                f"  [{ts()}] ORDER PARSE ERR  {order.product}  {e}  "
-                f"keys={list(data.keys())}  sample={str(data)[:400]}"
-            )
-            return None
 
     # ── callbacks ────────────────────────────────────────────────────────
 
@@ -161,6 +117,7 @@ class EtfArbBot(BaseBot):
 
         self._top[orderbook.product] = top
         self._maybe_arb()
+        self._maybe_fly()
 
     def on_trades(self, trade: Trade) -> None:
         direction = "BOT" if trade.buyer == self.username else "SLD"
@@ -171,7 +128,7 @@ class EtfArbBot(BaseBot):
             f"@ {trade.price:>7.0f}  cost={cost:>+10.0f}"
         )
 
-    # ── helpers ─────────────────────────────────────────────────────────
+    # ── helpers ──────────────────────────────────────────────────────────
 
     @staticmethod
     def _total_abs(p: tuple[int, int, int, int]) -> int:
@@ -181,21 +138,134 @@ class EtfArbBot(BaseBot):
     def _near_limit(p: tuple[int, int, int, int]) -> bool:
         return any(abs(x) >= LIMIT_NEAR for x in p)
 
-    # ── arbitrage logic ──────────────────────────────────────────────────
+    # ── LHR_FLY fair value ───────────────────────────────────────────────
 
-    def _log_skip(self, reason: str) -> None:
-        """Log why we didn't trade (throttled when DIAG)."""
-        if not DIAG:
-            return
+    @staticmethod
+    def _fly_payoff(s: float) -> float:
+        """
+        Payoff of +2P6200 +2C6200 -2C6600 +3C7000 at underlying level s.
+
+        By region:
+          s < 6200            :  2*(6200-s)          [downside profit]
+          6200 <= s < 6600    :  2*(s-6200)           [long the move up]
+          6600 <= s < 7000    :  800                  [flat plateau]
+          s >= 7000           :  800 + 3*(s-7000)     [re-accelerates]
+        """
+        return (
+            2 * max(6200 - s, 0.0)
+            + 2 * max(s - 6200, 0.0)
+            - 2 * max(s - 6600, 0.0)
+            + 3 * max(s - 7000, 0.0)
+        )
+
+    # ── LHR_FLY trading logic ────────────────────────────────────────────
+
+    def _maybe_fly(self) -> None:
         now = time.monotonic()
-        if now - self._last_skip_log_time >= SKIP_LOG_INTERVAL_S:
-            self._last_skip_log_time = now
-            self._diag(f"no trade: {reason}")
+        if now - self._last_fly_time < FLY_COOLDOWN:
+            return
+
+        fly = self._top[LHR_FLY]
+        lhr = self._top[LHR_INDEX]
+
+        # Need full quotes on both
+        if any(v is None for v in (fly.bid_px, fly.ask_px, lhr.bid_px, lhr.ask_px)):
+            return
+
+        # Reject if LHR spread is too wide — mid would be unreliable
+        lhr_mid = (lhr.bid_px + lhr.ask_px) / 2.0
+        lhr_spread_pct = (lhr.ask_px - lhr.bid_px) / lhr_mid
+        if lhr_spread_pct > FLY_MAX_SPREAD_PCT:
+            return
+
+        fair = self._fly_payoff(lhr_mid)
+
+        try:
+            pos = self.get_positions()
+        except Exception as exc:
+            print(f"  [{ts()}] WARN  fly position fetch failed: {exc}")
+            return
+
+        pos_fly = int(pos.get(LHR_FLY, 0))
+
+        # ── BUY fly: market ask is below fair value ──────────────────────
+        edge_buy = fair - fly.ask_px
+        if edge_buy > FLY_MIN_EDGE and pos_fly < FLY_POS_LIMIT:
+            vol = min(fly.ask_sz, FLY_MAX_VOL, FLY_POS_LIMIT - pos_fly)
+            if vol >= 1:
+                self._fire_fly(
+                    side=Side.BUY,
+                    price=fly.ask_px,
+                    vol=vol,
+                    fair=fair,
+                    edge=edge_buy,
+                    lhr_mid=lhr_mid,
+                    lhr_spread_pct=lhr_spread_pct,
+                    pos_fly=pos_fly,
+                )
+                self._last_fly_time = now
+                return
+
+        # ── SELL fly: market bid is above fair value ─────────────────────
+        edge_sell = fly.bid_px - fair
+        if edge_sell > FLY_MIN_EDGE and pos_fly > -FLY_POS_LIMIT:
+            vol = min(fly.bid_sz, FLY_MAX_VOL, FLY_POS_LIMIT + pos_fly)
+            if vol >= 1:
+                self._fire_fly(
+                    side=Side.SELL,
+                    price=fly.bid_px,
+                    vol=vol,
+                    fair=fair,
+                    edge=edge_sell,
+                    lhr_mid=lhr_mid,
+                    lhr_spread_pct=lhr_spread_pct,
+                    pos_fly=pos_fly,
+                )
+                self._last_fly_time = now
+                return
+
+    def _fire_fly(
+        self,
+        side: Side,
+        price: float,
+        vol: int,
+        fair: float,
+        edge: float,
+        lhr_mid: float,
+        lhr_spread_pct: float,
+        pos_fly: int,
+    ) -> None:
+        self._fly_count += 1
+        trade_theo = edge * vol
+        self._fly_theo_pnl += trade_theo
+
+        direction = "BUY " if side == Side.BUY else "SELL"
+        print(f"\n{'═'*72}")
+        print(f"[{ts()}] FLY #{self._fly_count}  {direction} LHR_FLY")
+        print(
+            f"  LHR mid = {lhr_mid:.1f}  spread = {lhr_spread_pct*100:.2f}%  "
+            f"fair = {fair:.1f}  market = {price:.0f}  edge = {edge:.1f}"
+        )
+        print(
+            f"  vol = {vol}  trade PnL = +{trade_theo:.0f}  "
+            f"cum fly PnL = +{self._fly_theo_pnl:.0f}  pos_fly = {pos_fly}"
+        )
+        print(f"  sending: {direction} {vol} LHR_FLY @ {price:.0f}")
+
+        order = OrderRequest(LHR_FLY, price, side, vol)
+        _, resp = self._send_ioc(order)
+
+        if resp and resp.filled > 0:
+            print(f"  FILLED {resp.filled}/{vol}")
+        else:
+            print(f"  NO FILL (resp={resp})")
+        print(f"{'═'*72}")
+
+    # ── ETF arbitrage logic ──────────────────────────────────────────────
 
     def _maybe_arb(self) -> None:
         now = time.monotonic()
         if now - self._last_trade_time < MIN_COOLDOWN:
-            self._log_skip("cooldown")
             return
 
         E = self._top[ETF]
@@ -207,7 +277,6 @@ class EtfArbBot(BaseBot):
             v is None
             for v in (E.bid_px, E.ask_px, A.bid_px, A.ask_px, B.bid_px, B.ask_px, C.bid_px, C.ask_px)
         ):
-            self._log_skip("missing book (incomplete top of book)")
             return
 
         basket_ask = A.ask_px + B.ask_px + C.ask_px
@@ -252,8 +321,8 @@ class EtfArbBot(BaseBot):
             vol = min(
                 min(E.bid_sz, MAX_TRADE_VOL),
                 min(A.ask_sz, B.ask_sz, C.ask_sz, MAX_TRADE_VOL),
-                POS_LIMIT + pe,  # SELL ETF headroom to -POS_LIMIT
-                POS_LIMIT - pa,  # BUY component headroom to +POS_LIMIT
+                POS_LIMIT + pe,   # SELL ETF headroom to -POS_LIMIT
+                POS_LIMIT - pa,   # BUY component headroom to +POS_LIMIT
                 POS_LIMIT - pb,
                 POS_LIMIT - pc,
             )
@@ -267,22 +336,16 @@ class EtfArbBot(BaseBot):
                     edge_per_lot=edge1,
                     vol=vol,
                     orders=[
-                        OrderRequest(ETF, E.bid_px, Side.SELL, vol),
-                        OrderRequest(COMPONENTS[0], A.ask_px, Side.BUY, vol),
-                        OrderRequest(COMPONENTS[1], B.ask_px, Side.BUY, vol),
-                        OrderRequest(COMPONENTS[2], C.ask_px, Side.BUY, vol),
+                        OrderRequest(ETF,          E.bid_px, Side.SELL, vol),
+                        OrderRequest(COMPONENTS[0], A.ask_px, Side.BUY,  vol),
+                        OrderRequest(COMPONENTS[1], B.ask_px, Side.BUY,  vol),
+                        OrderRequest(COMPONENTS[2], C.ask_px, Side.BUY,  vol),
                     ],
                     prices={"ETF_sell": E.bid_px, "A_buy": A.ask_px, "B_buy": B.ask_px, "C_buy": C.ask_px},
                     positions=p0,
                 )
                 self._last_trade_time = now
                 return
-            self._log_skip(f"case1 vol=0 (bid_sz={E.bid_sz} ask_sz={A.ask_sz},{B.ask_sz},{C.ask_sz} limits)")
-        else:
-            self._log_skip(
-                f"case1 edge {edge1:.1f} <= req {required_edge1:.1f} "
-                f"(E.bid={E.bid_px} basket_ask={basket_ask:.0f})"
-            )
 
         # Case 2: ETF cheap → buy ETF, sell components
         edge2 = basket_bid - E.ask_px
@@ -290,8 +353,8 @@ class EtfArbBot(BaseBot):
             vol = min(
                 min(E.ask_sz, MAX_TRADE_VOL),
                 min(A.bid_sz, B.bid_sz, C.bid_sz, MAX_TRADE_VOL),
-                POS_LIMIT - pe,  # BUY ETF headroom to +POS_LIMIT
-                POS_LIMIT + pa,  # SELL component headroom to -POS_LIMIT
+                POS_LIMIT - pe,   # BUY ETF headroom to +POS_LIMIT
+                POS_LIMIT + pa,   # SELL component headroom to -POS_LIMIT
                 POS_LIMIT + pb,
                 POS_LIMIT + pc,
             )
@@ -305,7 +368,7 @@ class EtfArbBot(BaseBot):
                     edge_per_lot=edge2,
                     vol=vol,
                     orders=[
-                        OrderRequest(ETF, E.ask_px, Side.BUY, vol),
+                        OrderRequest(ETF,          E.ask_px, Side.BUY,  vol),
                         OrderRequest(COMPONENTS[0], A.bid_px, Side.SELL, vol),
                         OrderRequest(COMPONENTS[1], B.bid_px, Side.SELL, vol),
                         OrderRequest(COMPONENTS[2], C.bid_px, Side.SELL, vol),
@@ -315,32 +378,15 @@ class EtfArbBot(BaseBot):
                 )
                 self._last_trade_time = now
                 return
-            self._log_skip(f"case2 vol=0 (ask_sz={E.ask_sz} bid_sz={A.bid_sz},{B.bid_sz},{C.bid_sz} limits)")
-        else:
-            self._log_skip(
-                f"case2 edge {edge2:.1f} <= req {required_edge2:.1f} "
-                f"(basket_bid={basket_bid:.0f} E.ask={E.ask_px})"
-            )
 
     def _send_ioc(self, order: OrderRequest) -> tuple[OrderRequest, OrderResponse | None]:
-        """Send an order and cancel any unfilled remainder after a short delay (IOC-like)."""
+        """Send an order and immediately cancel any unfilled remainder (IOC simulation)."""
         resp = self.send_order(order)
-        filled = getattr(resp, "filled", 0) if resp else 0
-        if DIAG and resp:
-            print(
-                f"  [{ts()}] DIAG  RSP  {order.product} {order.side}  id={getattr(resp,'id','?')}  "
-                f"status={getattr(resp,'status','?')}  filled={filled}  volume={getattr(resp,'volume',0)}"
-            )
-        if resp and getattr(resp, "volume", 0) > 0:
-            if IOC_CANCEL_DELAY_S > 0:
-                time.sleep(IOC_CANCEL_DELAY_S)
+        if resp and resp.volume > 0:
             try:
                 self.cancel_order(resp.id)
-                if DIAG:
-                    self._diag(f"cancel sent for {order.product} id={resp.id}")
-            except Exception as e:
-                if DIAG:
-                    self._diag(f"cancel failed {order.product} {resp.id}: {e}")
+            except Exception:
+                pass
         return order, resp
 
     def _fire_arb(
@@ -379,12 +425,9 @@ class EtfArbBot(BaseBot):
         for t in threads:
             t.join()
 
-        def _filled(r: OrderResponse | None) -> int:
-            return getattr(r, "filled", 0) if r else 0
-
-        filled_legs = [(req, resp) for req, resp in results if resp and _filled(resp) > 0]
+        filled_legs = [(req, resp) for req, resp in results if resp and resp.filled > 0]
         fill_summary = "  ".join(
-            f"{req.product}:{_filled(resp)}/{req.volume}" if resp else f"{req.product}:ERR/{req.volume}"
+            f"{req.product}:{resp.filled if resp else 'X'}/{req.volume}"
             for req, resp in results
         )
 
@@ -392,16 +435,6 @@ class EtfArbBot(BaseBot):
             print(f"  FILLED  all {len(orders)} legs  ({fill_summary})")
         else:
             print(f"  PARTIAL {len(filled_legs)}/{len(orders)} legs  ({fill_summary})")
-            # Diagnose which legs failed
-            for req, resp in results:
-                f = _filled(resp) if resp else -1
-                if f != req.volume:
-                    status = getattr(resp, "status", None) if resp else None
-                    oid = getattr(resp, "id", None) if resp else None
-                    print(
-                        f"    MISS  {req.product} {req.side}  filled={f}/{req.volume}  "
-                        f"status={status}  id={oid}"
-                    )
 
         print(f"{'─'*72}")
 
@@ -419,13 +452,16 @@ class EtfArbBot(BaseBot):
             f"  params:     MIN_EDGE={MIN_EDGE}  UNWIND_EDGE={UNWIND_EDGE}  "
             f"MAX_VOL={MAX_TRADE_VOL}  POS_LIMIT={POS_LIMIT}  COOLDOWN={MIN_COOLDOWN}s"
         )
+        print(
+            f"  fly params: FLY_MIN_EDGE={FLY_MIN_EDGE}  FLY_MAX_VOL={FLY_MAX_VOL}  "
+            f"FLY_POS_LIMIT={FLY_POS_LIMIT}  MAX_SPREAD={FLY_MAX_SPREAD_PCT*100:.0f}%  "
+            f"COOLDOWN={FLY_COOLDOWN}s"
+        )
         print(f"  start PnL:  {self._start_pnl:.0f}")
 
         pos = self.get_positions()
         pos_str = "  ".join(f"{k}={v}" for k, v in sorted(pos.items())) if pos else "(flat)"
         print(f"  positions:  {pos_str}")
-        if DIAG:
-            print(f"  DIAG:      ON (skip log every {SKIP_LOG_INTERVAL_S}s, IOC delay {IOC_CANCEL_DELAY_S}s)")
         print(f"  Ctrl+C to stop.\n")
 
         self.start()
@@ -439,8 +475,10 @@ class EtfArbBot(BaseBot):
             session_pnl = final_pnl - self._start_pnl
             print(f"  final PnL:       {final_pnl:.0f}")
             print(f"  session PnL:     {session_pnl:+.0f}")
-            print(f"  theoretical PnL: +{self._theoretical_pnl:.0f}")
+            print(f"  theoretical PnL (arb): +{self._theoretical_pnl:.0f}")
+            print(f"  theoretical PnL (fly): +{self._fly_theo_pnl:.0f}")
             print(f"  arb trades:      {self._arb_count}")
+            print(f"  fly trades:      {self._fly_count}")
             pos = self.get_positions()
             print(f"  positions:       {pos}")
             sys.exit(0)
@@ -457,8 +495,9 @@ class EtfArbBot(BaseBot):
                 pos = self.get_positions()
                 pos_str = "  ".join(f"{k}={v}" for k, v in sorted(pos.items()))
                 print(
-                    f"[{ts()}] HEARTBEAT  arbs={self._arb_count}  "
-                    f"session={session_pnl:+.0f}  theo={self._theoretical_pnl:+.0f}  "
+                    f"[{ts()}] HEARTBEAT  arbs={self._arb_count}  flys={self._fly_count}  "
+                    f"session={session_pnl:+.0f}  "
+                    f"theo_arb={self._theoretical_pnl:+.0f}  theo_fly={self._fly_theo_pnl:+.0f}  "
                     f"actual={actual_pnl:.0f}  pos=[{pos_str}]"
                 )
             except Exception as exc:
