@@ -32,7 +32,7 @@ import requests
 
 from bot_template import BaseBot, OrderBook, OrderRequest, OrderResponse, Side, Trade
 
-EXCHANGE_URL = "http://ec2-52-19-74-159.eu-west-1.compute.amazonaws.com"
+EXCHANGE_URL = "http://ec2-52-19-74-159.eu-west-1.compute.amazonaws.com/"
 USERNAME = "RATT"
 PASSWORD = "ratt67"
 
