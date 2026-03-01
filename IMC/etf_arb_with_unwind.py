@@ -29,9 +29,9 @@ from typing import Optional
 
 from bot_template import BaseBot, OrderBook, OrderRequest, OrderResponse, Side, Trade
 
-EXCHANGE_URL = "http://ec2-52-49-69-152.eu-west-1.compute.amazonaws.com/"
-USERNAME = "timgu"
-PASSWORD = "1!Qwerty"
+EXCHANGE_URL = "http://ec2-52-19-74-159.eu-west-1.compute.amazonaws.com/"
+USERNAME = "RATT"
+PASSWORD = "ratt67"
 
 ETF = "LON_ETF"
 COMPONENTS = ["TIDE_SPOT", "WX_SPOT", "LHR_COUNT"]
